@@ -1,0 +1,230 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lint Python (flake8)
+        run: |
+          pip install flake8
+          flake8 api/ worker/ --max-line-length=100 --exclude=api/tests/__pycache__
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Lint JavaScript (eslint)
+        run: |
+          cd frontend
+          npm install --include=dev
+          npx eslint app.js
+
+      - name: Lint Dockerfiles (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+          failure-threshold: error
+
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+          failure-threshold: error
+
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+          failure-threshold: error
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install fastapi==0.111.0 uvicorn==0.29.0 redis==5.0.4 httpx==0.27.0 pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: |
+          cd api
+          pytest tests/ --cov=. --cov-report=xml --cov-report=term
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push all images to local registry
+        run: |
+          SHA=${{ github.sha }}
+          for svc in api worker frontend; do
+            docker build -t localhost:5000/$svc:$SHA -t localhost:5000/$svc:latest ./$svc
+            docker push localhost:5000/$svc:$SHA
+            docker push localhost:5000/$svc:latest
+          done
+
+  security:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images for scanning
+        run: |
+          for svc in api worker frontend; do
+            docker build -t $svc:scan ./$svc
+          done
+
+      - name: Fail on CRITICAL CVEs (api)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: api:scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Fail on CRITICAL CVEs (worker)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: worker:scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Fail on CRITICAL CVEs (frontend)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: frontend:scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Generate SARIF report for upload
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: api:scan
+          format: sarif
+          output: trivy-api.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-api.sarif
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: echo "REDIS_PASSWORD=testpassword" > .env
+
+      - name: Start full stack
+        run: docker compose up -d --build
+
+      - name: Wait for frontend to be ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000 && break || sleep 2
+          done
+
+      - name: Submit job and poll until completed
+        run: |
+          JOB_ID=$(curl -sf -X POST http://localhost:3000/submit | jq -r '.job_id')
+          echo "Submitted job: $JOB_ID"
+          for i in $(seq 1 30); do
+            STATUS=$(curl -sf http://localhost:3000/status/$JOB_ID | jq -r '.status')
+            echo "Status: $STATUS"
+            [ "$STATUS" = "completed" ] && exit 0
+            sleep 2
+          done
+          echo "ERROR: job did not complete in time"
+          exit 1
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rolling deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          passphrase: ${{ secrets.SERVER_SSH_PASSPHRASE }}
+          script: |
+            cd ~/hng14-stage2-devops
+            git pull origin main
+
+            # Ensure Redis is up and healthy before rolling app services
+            docker compose up -d redis
+            for i in $(seq 1 12); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' $(docker compose ps -q redis) 2>/dev/null)
+              echo "redis health: $STATUS"
+              [ "$STATUS" = "healthy" ] && break
+              [ $i -eq 12 ] && echo "Redis failed to become healthy" && exit 1
+              sleep 5
+            done
+
+            for svc in api worker frontend; do
+              docker compose build $svc
+              docker compose up -d --no-deps $svc
+
+              CONTAINER=$(docker compose ps -q $svc)
+              for i in $(seq 1 12); do
+                STATUS=$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER 2>/dev/null)
+                echo "$svc health: $STATUS"
+                [ "$STATUS" = "healthy" ] && break
+                [ $i -eq 12 ] && echo "Health check failed for $svc — aborting" && exit 1
+                sleep 5
+              done
+            done
+            echo "Deploy complete"

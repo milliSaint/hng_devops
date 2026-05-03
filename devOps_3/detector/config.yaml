@@ -1,0 +1,31 @@
+log_path: /var/log/nginx/hng-access.log
+audit_log: /var/log/detector/audit.log
+dashboard_port: 8080
+
+# Sliding window duration in seconds
+sliding_window_seconds: 60
+
+# Rolling baseline settings
+baseline_window_minutes: 30
+baseline_recalc_interval: 60
+baseline_min_samples: 30
+baseline_floor_mean: 1.0
+baseline_floor_stddev: 0.5
+
+# Anomaly thresholds
+zscore_threshold: 3.0
+multiplier_threshold: 5.0
+
+# Error surge: if ip error rate > this * baseline error rate, tighten thresholds
+error_rate_multiplier: 3.0
+# When error surge fires, thresholds are multiplied by this factor (< 1.0 = tighter)
+error_surge_tighten_factor: 0.5
+
+# Ban durations in seconds: 10 min, 30 min, 2 hours; after 3 bans = permanent
+ban_durations:
+  - 600
+  - 1800
+  - 7200
+
+# Slack webhook URL (override via SLACK_WEBHOOK_URL env var)
+slack_webhook_url: ""
